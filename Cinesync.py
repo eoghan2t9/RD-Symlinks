@@ -14,7 +14,8 @@ from rich.console import Console
 from rich.logging import RichHandler
 import logging
 from guessit import guessit
-from imdb import IMDb
+import tmdbsimple as tmdb
+from tvdb_api import Tvdb
 
 # Initialize Rich logging
 console = Console()
@@ -30,10 +31,10 @@ script_path = os.path.join(script_directory, "Cinesync.py")
 
 # Determine the paths based on the operating system
 if os.name == 'posix':  # Linux
-    MOVIES_WATCH_DIRECTORY = os.getenv('MOVIES_WATCH_DIRECTORY', "YOUR-PATH-TO-YOUR-RD-MOVIES-FOLDER")
-    MOVIES_TARGET_DIRECTORY = os.getenv('MOVIES_TARGET_DIRECTORY', "YOUR-PATH-TO-YOUR-LOCAL-MOVIES-FOLDER")
-    SERIES_WATCH_DIRECTORY = os.getenv('SERIES_WATCH_DIRECTORY', "YOUR-PATH-TO-YOUR-RD-SERIES-FOLDER")
-    SERIES_TARGET_DIRECTORY = os.getenv('SERIES_TARGET_DIRECTORY', "YOUR-PATH-TO-YOUR-LOCAL-MOVIES-FOLDER")
+    MOVIES_WATCH_DIRECTORY = os.getenv('MOVIES_WATCH_DIRECTORY', "/mnt/remote/realdebrid/movies/")
+    MOVIES_TARGET_DIRECTORY = os.getenv('MOVIES_TARGET_DIRECTORY', "/media-files/Movies")
+    SERIES_WATCH_DIRECTORY = os.getenv('SERIES_WATCH_DIRECTORY', "/mnt/remote/realdebrid/shows/")
+    SERIES_TARGET_DIRECTORY = os.getenv('SERIES_TARGET_DIRECTORY', "/media-files/TV-Shows")
     WORKING_DIRECTORY = os.getenv('WORKING_DIRECTORY', "YOUR-PATH-TO-THIS-FOLDER-WITH-THE-CINESYNC.PY-FILE-INIT")
 elif os.name == 'nt':  # Windows
     MOVIES_WATCH_DIRECTORY = os.getenv('MOVIES_WATCH_DIRECTORY', r"E:\movies")
@@ -63,7 +64,6 @@ class Handler(FileSystemEventHandler):
         self.movies_target_directory = movies_target_directory
         self.series_watch_directory = series_watch_directory
         self.series_target_directory = series_target_directory
-        self.imdb = IMDb()
         self.symlink_map_file = os.path.join(movies_target_directory, 'symlink_map.json')
         self.load_symlink_map()
 
@@ -86,22 +86,70 @@ class Handler(FileSystemEventHandler):
         if file_path.endswith(('.mp4', '.mkv')):
             try:
                 file_info = guessit(file_path)
-                title = file_info.get('title')
-                file_type = file_info.get('type')
-                imdb_id = self.get_imdb_id(title)
 
+                original_title = file_info.get('title')
                 if file_path.startswith(self.movies_watch_directory):
-                    if file_type == 'movie':
-                        self.process_movie(file_path, file_info, imdb_id)
+                    file_type = 'movie'
+                    id_from_api = self.get_tmdb_id(original_title) 
                 elif file_path.startswith(self.series_watch_directory):
-                    if file_type == 'episode':
-                        self.process_series(file_path, file_info, imdb_id)
+                    file_type = 'episode'
+                    id_from_api = self.get_tvdb_id(original_title) 
                 else:
                     logger.warning("Unknown file type for {}".format(file_path))
+                    return 
+
+                if id_from_api == "N/A":  # If no ID found, try removing special characters
+                    special_chars = ['#', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+                    while file_info.get('title', '').startswith(tuple(special_chars)):
+                        file_info['title'] = file_info['title'][1:]
+
+                    if file_path.startswith(self.movies_watch_directory):
+                        id_from_api = self.get_tmdb_id(file_info.get('title'))
+                    elif file_path.startswith(self.series_watch_directory):
+                        id_from_api = self.get_tvdb_id(file_info.get('title'))
+
+                if file_type == 'movie':
+                    self.process_movie(file_path, file_info, id_from_api)
+                elif file_type == 'episode':
+                    self.process_series(file_path, file_info, id_from_api)
             except Exception as e:
                 logger.error("Error processing file: {}".format(e))
 
-    def process_movie(self, file_path, file_info, imdb_id):
+    def get_tmdb_id(self, title):
+        try:
+            tmdb.API_KEY = 'YOURTMDBKEY'  # Replace with your actual TMDb API key
+            search = tmdb.Search()
+            # Remove year from the search query 
+            response = search.movie(query=title.split("(")[0].strip())  
+            if response['results']:
+                # Find the closest match based on the original title including the year
+                best_match = max(response['results'], key=lambda x: self.similarity(x['title'], title))
+                return best_match['id']  
+            else:
+                logger.warning(f"No TMDb ID found for title: {title}")
+                return "N/A"
+        except Exception as e:
+            logger.error(f"Error fetching TMDb ID: {e}")
+            return "N/A"
+
+    def get_tvdb_id(self, series_title):
+        try:
+            tvdb_instance = Tvdb('YOURTVDBKEY')  # Replace with your actual TVDB API key
+            results = tvdb_instance.search(series_title)
+            if results:
+                return results[0]['id']
+            else:
+                logger.warning(f"No TVDB ID found for series: {series_title}")
+                return "N/A"
+        except Exception as e:
+            logger.error(f"Error fetching TVDB ID: {e}")
+            return "N/A"
+
+    def similarity(self, a, b):
+        # Simple string similarity check (you could use a more sophisticated method if needed)
+        return sum(1 for x, y in zip(a, b) if x == y) / max(len(a), len(b))
+
+    def process_movie(self, file_path, file_info, tmdb_id):
         title = file_info.get('title')
         year = file_info.get('year')
 
@@ -129,20 +177,16 @@ class Handler(FileSystemEventHandler):
                 self.save_symlink_map()
                 logger.info(f"Symlink created: {symlink_path}")
 
-            # Add IMDb ID and year in curly braces to the movie folder name if found
-            if imdb_id != "N/A" and year:
-                formatted_imdb_id = f"imdb-tt{imdb_id}"
+            # Add TMDb ID and year in curly braces to the movie folder name if found
+            if tmdb_id != "N/A" and year:
+                formatted_tmdb_id = f"tmdb-{tmdb_id}"
                 new_movie_dir = os.path.join(
-                    self.movies_target_directory, f"{title} ({year}) {{{formatted_imdb_id}}}"
+                    self.movies_target_directory, f"{title} ({year}) {{{formatted_tmdb_id}}}"
                 )
                 os.rename(movie_dir, new_movie_dir)
                 logger.info(f"Renamed movies folder: {movie_dir} to {new_movie_dir}")
-        else:
-            logger.info(
-                f"Skipping symlink creation for {file_path} as the directory {movie_dir} is not empty."
-            )
 
-    def process_series(self, file_path, file_info, imdb_id):
+    def process_series(self, file_path, file_info, tvdb_id):
         series_title = file_info.get("title") or file_info.get("series")
         season_number = file_info.get("season")
         episode_number = file_info.get("episode")
@@ -173,18 +217,14 @@ class Handler(FileSystemEventHandler):
                 self.save_symlink_map()
                 logger.info(f"Symlink created: {symlink_path}")
 
-            # Add IMDb ID and year in curly braces to the series folder name if found
-            if imdb_id != "N/A" and year:
-                formatted_imdb_id = f"imdb-tt{imdb_id}"
+            # Add TVDB ID and year in curly braces to the series folder name if found
+            if tvdb_id != "N/A" and year:
+                formatted_tvdb_id = f"tvdb-{tvdb_id}"
                 new_series_dir = os.path.join(
-                    self.series_target_directory, f"{series_title} ({year}) {{{formatted_imdb_id}}}"
+                    self.series_target_directory, f"{series_title} ({year}) {{{formatted_tvdb_id}}}"
                 )
                 os.rename(series_dir, new_series_dir)
                 logger.info(f"Renamed series folder: {series_dir} to {new_series_dir}")
-        else:
-            logger.info(
-                f"Skipping symlink creation for {file_path} as the directory {season_dir} is not empty."
-            )
 
     def get_imdb_id(self, title):
         try:
