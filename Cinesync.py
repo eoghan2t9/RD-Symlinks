@@ -150,7 +150,7 @@ class Handler(FileSystemEventHandler):
 
     def get_tmdb_id(self, title, is_movie=True):
         try:
-            tmdb.API_KEY = '**************************'
+            tmdb.API_KEY = 'YOUR API KEY GOES HERE'
             search = tmdb.Search()
 
             if is_movie:
@@ -223,6 +223,11 @@ class Handler(FileSystemEventHandler):
         series_title = file_info.get("title") or file_info.get("series")
         season_number = file_info.get("season")
         episode_number = file_info.get("episode")
+        
+        # Additional Check to Exclude Movie Files
+        if file_info.get('type') == 'movie':
+            logger.warning(f"Skipping file {file_path} as it appears to be a movie, not a series episode.")
+            return  # Stop processing if it's a movie        
 
         # Try to extract the year from the title
         try:
