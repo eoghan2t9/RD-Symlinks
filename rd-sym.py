@@ -1,22 +1,18 @@
 import os
 import sys
-import json
+import sqlite3
 import subprocess
 import argparse
 from time import sleep
-
-# Add this line to print sys.path
-#print("Python Path:", sys.path)
-
+import threading
+import logging
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from rich.console import Console
 from rich.logging import RichHandler
-import logging
 from guessit import guessit
 import tmdbsimple as tmdb
 import re
-import concurrent.futures
 
 # Initialize Rich logging
 console = Console()
@@ -36,13 +32,13 @@ if os.name == 'posix':  # Linux
     MOVIES_TARGET_DIRECTORY = os.getenv('MOVIES_TARGET_DIRECTORY', "/media-files/Movies")
     SERIES_WATCH_DIRECTORY = os.getenv('SERIES_WATCH_DIRECTORY', "/mnt/remote/realdebrid/shows/")
     SERIES_TARGET_DIRECTORY = os.getenv('SERIES_TARGET_DIRECTORY', "/media-files/TV-Shows")
-    WORKING_DIRECTORY = os.getenv('WORKING_DIRECTORY', "YOUR-PATH-TO-THIS-FOLDER-WITH-THE-CINESYNC.PY-FILE-INIT")
+    WORKING_DIRECTORY = os.getenv('WORKING_DIRECTORY', script_directory)
 elif os.name == 'nt':  # Windows
     MOVIES_WATCH_DIRECTORY = os.getenv('MOVIES_WATCH_DIRECTORY', r"E:\movies")
     MOVIES_TARGET_DIRECTORY = os.getenv('MOVIES_TARGET_DIRECTORY', r"C:\test")
     SERIES_WATCH_DIRECTORY = os.getenv('SERIES_WATCH_DIRECTORY', r"E:\shows")
     SERIES_TARGET_DIRECTORY = os.getenv('SERIES_TARGET_DIRECTORY', r"C:\test")
-    WORKING_DIRECTORY = os.getenv('WORKING_DIRECTORY', r"C:\YOUR-PATH-TO-THIS-FOLDER-WITH-THE-CINESYNC.PY-FILE-INIT")
+    WORKING_DIRECTORY = os.getenv('WORKING_DIRECTORY', script_directory)
 else:
     raise NotImplementedError("Unsupported operating system")
 
@@ -53,11 +49,11 @@ SERIES_WATCH_DIRECTORY = os.path.abspath(os.path.normpath(SERIES_WATCH_DIRECTORY
 SERIES_TARGET_DIRECTORY = os.path.abspath(os.path.normpath(SERIES_TARGET_DIRECTORY))
 WORKING_DIRECTORY = os.path.abspath(os.path.normpath(WORKING_DIRECTORY))
 
-logger.info("Movies Watch Directory: {}".format(MOVIES_WATCH_DIRECTORY))
-logger.info("Movies Target Directory: {}".format(MOVIES_TARGET_DIRECTORY))
-logger.info("Series Watch Directory: {}".format(SERIES_WATCH_DIRECTORY))
-logger.info("Series Target Directory: {}".format(SERIES_TARGET_DIRECTORY))
-logger.info("Working Directory: {}".format(WORKING_DIRECTORY))
+#logger.info("Movies Watch Directory: {}".format(MOVIES_WATCH_DIRECTORY))
+#logger.info("Movies Target Directory: {}".format(MOVIES_TARGET_DIRECTORY))
+#logger.info("Series Watch Directory: {}".format(SERIES_WATCH_DIRECTORY))
+#logger.info("Series Target Directory: {}".format(SERIES_TARGET_DIRECTORY))
+#logger.info("Working Directory: {}".format(WORKING_DIRECTORY))
 
 class Handler(FileSystemEventHandler):
     def __init__(self, movies_watch_directory, movies_target_directory, series_watch_directory, series_target_directory):
@@ -65,48 +61,59 @@ class Handler(FileSystemEventHandler):
         self.movies_target_directory = movies_target_directory
         self.series_watch_directory = series_watch_directory
         self.series_target_directory = series_target_directory
-        self.symlink_map_file = os.path.join(movies_target_directory, 'symlink_map.json')
-        self.load_symlink_map()
+        self.db_path = os.path.join(script_directory, 'symlink_map.db')
+        self.init_db()
 
+    def init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS symlink_map (
+                file_path TEXT PRIMARY KEY,
+                symlink_path TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info(f"Initialized database at {self.db_path}")
 
-    def load_symlink_map(self):
-        if os.path.exists(self.symlink_map_file):
-            with open(self.symlink_map_file, 'r') as f:
-                self.symlink_map = json.load(f)
-        else:
-            self.symlink_map = {}
+    def add_symlink(self, file_path, symlink_path):
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute('REPLACE INTO symlink_map (file_path, symlink_path) VALUES (?, ?)', (file_path, symlink_path))
+        conn.commit()
+        conn.close()
+        logger.info(f"Added symlink to database: {file_path} -> {symlink_path}")
 
-    def save_symlink_map(self):
-        with open(self.symlink_map_file, 'w') as f:
-            json.dump(self.symlink_map, f, indent=4)
+    def get_symlink(self, file_path):
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute('SELECT symlink_path FROM symlink_map WHERE file_path = ?', (file_path,))
+        result = cur.fetchone()
+        conn.close()
+        if result:
+            logger.info(f"Found existing symlink in database: {file_path} -> {result[0]}")
+        return result[0] if result else None
 
     def on_created(self, event):
         if not event.is_directory:
-            self.process(event.src_path)
+            logger.info(f"File created: {event.src_path}")
+            threading.Thread(target=self.process, args=(event.src_path,)).start()
 
     def process(self, file_path):
+        logger.info(f"Processing file: {file_path}")
         if file_path.endswith(('.mp4', '.mkv')):
             try:
-                # Clean the filename and containing directory name
                 cleaned_file_name = self.clean_file_name(os.path.basename(file_path))
                 cleaned_dir_name = self.clean_file_name(os.path.basename(os.path.dirname(file_path)))
                 cleaned_file_path = os.path.join(os.path.dirname(file_path), cleaned_file_name)
 
                 file_info = guessit(cleaned_file_path) 
-
                 original_title = file_info.get('title')
+                
                 if file_path.startswith(self.movies_watch_directory):
                     file_type = 'movie'
                     id_from_api = self.get_tmdb_id(original_title)
-
-                    # Special character removal only for movies (NEW)
-                    if id_from_api == "N/A":
-                        special_chars = ['#', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
-                        special_chars_tuple = tuple(special_chars)
-                        while file_info.get('title', '').startswith(special_chars_tuple):
-                            file_info['title'] = file_info['title'][1:]
-
-                        id_from_api = self.get_tmdb_id(file_info.get('title'))
                 elif file_path.startswith(self.series_watch_directory):
                     file_type = 'episode'
                     id_from_api = self.get_tmdb_id(original_title, is_movie=False)
@@ -114,26 +121,14 @@ class Handler(FileSystemEventHandler):
                     logger.warning("Unknown file type for {}".format(file_path))
                     return
 
-                # Multi-Threading Implementation
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future_to_file_path = {}
-
-                    if file_type == 'movie':
-                        future_to_file_path[executor.submit(self.process_movie, file_path, file_info, id_from_api)] = file_path
-                    elif file_type == 'episode':
-                        future_to_file_path[executor.submit(self.process_series, file_path, file_info, id_from_api)] = file_path
-
-                    for future in concurrent.futures.as_completed(future_to_file_path):
-                        file_path = future_to_file_path[future]
-                        try:
-                            future.result()  # Get the result or raise an exception if any occurred
-                        except Exception as e:
-                            logger.error(f"Error processing file {file_path}: {e}")
+                if file_type == 'movie':
+                    self.process_movie(file_path, file_info, id_from_api)
+                elif file_type == 'episode':
+                    self.process_series(file_path, file_info, id_from_api)
 
             except Exception as e:
                 logger.error("Error processing file: %s", file_path, exc_info=True)
-                
-                
+
     def clean_file_name(self, name):
         words_to_remove = ["TEPES", "rartv", "1080p", "720p", "x264", "x265", "WEB-DL", "BluRay", "BRRip", "WEBRip"]  # Add more as needed
         for word in words_to_remove:
@@ -147,10 +142,9 @@ class Handler(FileSystemEventHandler):
 
         return name.strip()
 
-
     def get_tmdb_id(self, title, is_movie=True):
         try:
-            tmdb.API_KEY = 'YOUR API KEY GOES HERE'
+            tmdb.API_KEY = 'API KEY GOES HERE'
             search = tmdb.Search()
 
             if is_movie:
@@ -159,10 +153,9 @@ class Handler(FileSystemEventHandler):
             else:
                 # Handle potential colon after numbers in series titles
                 if title[0].isdigit() and ':' in title:
-                    # If a colon is found, split title and take the second part.
                     query = title.split(':', 1)[1].strip()
                 else:
-                    query = title  # Use the original title if no colon after numbers
+                    query = title
 
                 response = search.tv(query=query)
 
@@ -184,8 +177,9 @@ class Handler(FileSystemEventHandler):
         title = file_info.get('title')
         year = file_info.get('year')
 
-        # Check if symlink already exists
-        existing_symlink = self.symlink_map.get(file_path)
+        logger.info(f"Processing movie: {file_path} with title '{title}' and year '{year}'")
+
+        existing_symlink = self.get_symlink(file_path)
         if existing_symlink and os.path.islink(existing_symlink):
             logger.info(f"Symlink already exists for {file_path}: {existing_symlink}")
             return
@@ -194,17 +188,15 @@ class Handler(FileSystemEventHandler):
             logger.warning(f"Missing title for movie processing: {file_path}")
             return
 
-        # Construct the movie directory name with year and TMDb ID if found
         formatted_tmdb_id = f"tmdb-{tmdb_id}" if tmdb_id != "N/A" else ""
         movie_dir_name = f"{title} ({year}) {{{formatted_tmdb_id}}}" if year else f"{title} {{{formatted_tmdb_id}}}"
         movie_dir = os.path.join(self.movies_target_directory, movie_dir_name)
 
-        # Check if the movie directory already exists
         if os.path.exists(movie_dir) and os.listdir(movie_dir):
             logger.info(f"Skipping symlink creation for {file_path} as the directory {movie_dir} is not empty.")
             return
 
-        os.makedirs(movie_dir, exist_ok=True)  # Create the movie directory if it doesn't exist
+        os.makedirs(movie_dir, exist_ok=True)
         
         movie_file_name = f"{title}{os.path.splitext(file_path)[1]}"
         symlink_path = os.path.join(movie_dir, movie_file_name)
@@ -214,30 +206,31 @@ class Handler(FileSystemEventHandler):
         except OSError as e:
             logger.error(f"Failed to create symlink for {file_path}: {e}")
         else:
-            self.symlink_map[file_path] = symlink_path
-            self.save_symlink_map()
+            self.add_symlink(file_path, symlink_path)
             logger.info(f"Symlink created: {symlink_path}")
-
 
     def process_series(self, file_path, file_info, tmdb_id):
         series_title = file_info.get("title") or file_info.get("series")
         season_number = file_info.get("season")
         episode_number = file_info.get("episode")
-        
-        # Additional Check to Exclude Movie Files
+
+        logger.info(f"Processing series: {file_path} with title '{series_title}', season {season_number}, episode {episode_number}")
+
         if file_info.get('type') == 'movie':
             logger.warning(f"Skipping file {file_path} as it appears to be a movie, not a series episode.")
-            return  # Stop processing if it's a movie        
+            return
 
-        # Try to extract the year from the title
+        if not series_title:
+            logger.warning(f"Series title not found for file {file_path}, using directory name as title.")
+            series_title = os.path.basename(os.path.dirname(file_path))
+
         try:
             year_match = re.search(r"\((\d{4})\)", series_title)
             year = year_match.group(1) if year_match else None
         except AttributeError:
             year = None
 
-        # Existing symlink check 
-        existing_symlink = self.symlink_map.get(file_path)
+        existing_symlink = self.get_symlink(file_path)
         if existing_symlink and os.path.islink(existing_symlink):
             logger.info(f"Symlink already exists for {file_path}: {existing_symlink}")
             return
@@ -246,10 +239,13 @@ class Handler(FileSystemEventHandler):
             logger.warning(f"Missing information for series processing: {file_path}")
             return
 
-        # Construct series file name before any logic that might return early
+        if isinstance(season_number, list):
+            season_number = season_number[0]
+        if isinstance(episode_number, list):
+            episode_number = episode_number[0]
+
         series_file_name = f"{series_title} - S{season_number:02d}E{episode_number:02d}{os.path.splitext(file_path)[1]}"
 
-        # Normalize folder names for comparison (title case) - keep year
         def normalize_dir_name(name):
             year_match = re.search(r"\((\d{4})\)", name)
             year_part = year_match.group(0) if year_match else ""
@@ -259,10 +255,8 @@ class Handler(FileSystemEventHandler):
         
         normalized_series_dir_name = normalize_dir_name(series_title)
 
-        # Check if an exact match or similar folder exists (case-insensitive)
         existing_series_dirs = [d for d in os.listdir(self.series_target_directory) if normalize_dir_name(d) == normalized_series_dir_name]
         if existing_series_dirs:
-            # If the directory already exists, create a new name with a suffix (if duplicates exist)
             counter = 1
             while True:
                 new_series_dir_name = f"{series_title} ({year}) ({counter})" if counter > 1 else series_title
@@ -272,21 +266,17 @@ class Handler(FileSystemEventHandler):
                 counter += 1
 
             logger.warning(f"Series directory already exists. Creating a new directory: {new_series_dir}")
-            series_dir = new_series_dir  # Update series_dir
+            series_dir = new_series_dir
         else:
-            # If the directory doesn't exist, create it with the TMDB ID and year
             if tmdb_id != "N/A":
                 formatted_tmdb_id = f"tmdb-{tmdb_id}"
                 series_dir_name = f"{series_title} ({year}) {{{formatted_tmdb_id}}}" if year else f"{series_title} {{{formatted_tmdb_id}}}"
                 series_dir = os.path.join(self.series_target_directory, series_dir_name)
 
-        # Create the series directory
         os.makedirs(series_dir, exist_ok=True)
-
         season_dir = os.path.join(series_dir, f"Season {season_number:02d}")
-        os.makedirs(season_dir, exist_ok=True)  # Create season dir if it doesn't exist
+        os.makedirs(season_dir, exist_ok=True)
         
-        # Check if an exact match exists within the season folder
         existing_season_files = [f for f in os.listdir(season_dir) if normalize_dir_name(f) == normalize_dir_name(series_file_name)]
         if existing_season_files:
             logger.info(f"Skipping symlink creation for {file_path} as a similar file exists in the season directory.")
@@ -299,8 +289,7 @@ class Handler(FileSystemEventHandler):
         except OSError as e:
             logger.error(f"Failed to create symlink for {file_path}: {e}")
         else:
-            self.symlink_map[file_path] = symlink_path
-            self.save_symlink_map()
+            self.add_symlink(file_path, symlink_path)
             logger.info(f"Symlink created: {symlink_path}")
 
     def get_imdb_id(self, title):
@@ -343,36 +332,20 @@ def run_first_time_setup(movies_watch_directory, movies_target_directory, series
 
     handler = Handler(movies_watch_directory, movies_target_directory, series_watch_directory, series_target_directory)
 
-    # Multi-Threading Implementation
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_file_path = {}
-
-        # Process Movies
-        logger.info("Processing files in movies watch directory: {}".format(movies_watch_directory))
-        for subdir, _, files in os.walk(movies_watch_directory):
+    def process_files_in_directory(directory):
+        for subdir, _, files in os.walk(directory):
             for filename in files:
                 file_path = os.path.join(subdir, filename)
                 if os.path.isfile(file_path):
-                    future_to_file_path[executor.submit(handler.process, file_path)] = file_path
+                    logger.info(f"Found file for processing: {file_path}")
+                    threading.Thread(target=handler.process, args=(file_path,)).start()
 
-        # Process Series
-        logger.info("Processing files in series watch directory: {}".format(series_watch_directory))
-        for subdir, _, files in os.walk(series_watch_directory):
-            for filename in files:
-                file_path = os.path.join(subdir, filename)
-                if os.path.isfile(file_path):
-                    future_to_file_path[executor.submit(handler.process, file_path)] = file_path
-
-        # Wait for Completion and Handle Exceptions
-        for future in concurrent.futures.as_completed(future_to_file_path):
-            file_path = future_to_file_path[future]
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error processing file {file_path}: {e}")
+    logger.info("Processing files in movies watch directory: {}".format(movies_watch_directory))
+    process_files_in_directory(movies_watch_directory)
+    logger.info("Processing files in series watch directory: {}".format(series_watch_directory))
+    process_files_in_directory(series_watch_directory)
 
     logger.info("First-time setup completed.")
-
 
 def setup_service():
     print("Choose the service setup:")
@@ -381,65 +354,55 @@ def setup_service():
     choice = input("Enter your choice: ")
 
     if choice == "1":
-        # Setup systemd service
         setup_systemd_service()
     elif choice == "2":
-        # Setup Windows service
         setup_windows_service()
     else:
         print("Invalid choice. Please enter '1' or '2'.")
 
 def setup_systemd_service():
-    # Write systemd service file
-    service_content = """
+    service_content = f"""
 [Unit]
 Description=File Watcher Service
 After=network.target
 
 [Service]
 ExecStart=/usr/bin/python3 {script_path} --watch
-WorkingDirectory={working_directory}
+WorkingDirectory={WORKING_DIRECTORY}
 StandardOutput=syslog
 StandardError=syslog
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
-""".format(script_path=script_path, working_directory=WORKING_DIRECTORY)
+"""
     
     with open('/etc/systemd/system/file_watcher.service', 'w') as f:
         f.write(service_content)
 
-    # Enable and start the service
     subprocess.run(['sudo', 'systemctl', 'daemon-reload'])
     subprocess.run(['sudo', 'systemctl', 'enable', 'file_watcher.service'])
     subprocess.run(['sudo', 'systemctl', 'start', 'file_watcher.service'])
     print("Systemd service setup complete.")
 
 def setup_windows_service():
-    # Path to the batch script that runs the Python script
     batch_script_path = os.path.abspath("CineSync.bat")
     
-    # Create the batch script content
-    batch_script_content = """
+    batch_script_content = f"""
 @echo off
 cd /d %~dp0
 python {script_path} --watch
-""".format(script_path=script_path)
+"""
 
-    # Write the batch script to a file
     with open(batch_script_path, "w") as batch_file:
         batch_file.write(batch_script_content)
 
-    # Install the service using SC command
     service_name = "FileWatcherService"
     service_exe_path = os.path.abspath("CineSync.bat")
-    sc_create_command = 'sc create {service_name} binPath= "{service_exe_path}" start= auto'.format(service_name=service_name, service_exe_path=service_exe_path)
+    sc_create_command = f'sc create {service_name} binPath= "{service_exe_path}" start= auto'
     
-    # Start the service
-    sc_start_command = 'sc start {service_name}'.format(service_name=service_name)
+    sc_start_command = f'sc start {service_name}'
 
-    # Execute SC commands
     subprocess.run(sc_create_command, shell=True)
     subprocess.run(sc_start_command, shell=True)
 
@@ -460,6 +423,15 @@ def main():
     elif args.service:
         setup_service()
     else:
+        # Clearing the Screen
+        def cls():
+            os.system('cls' if os.name=='nt' else 'clear')
+        cls()
+        logger.info("Movies Watch Directory: {}".format(MOVIES_WATCH_DIRECTORY))
+        logger.info("Movies Target Directory: {}".format(MOVIES_TARGET_DIRECTORY))
+        logger.info("Series Watch Directory: {}".format(SERIES_WATCH_DIRECTORY))
+        logger.info("Series Target Directory: {}".format(SERIES_TARGET_DIRECTORY))
+        logger.info("Working Directory: {}".format(WORKING_DIRECTORY))
         print(r"""
 
     a88888b. oo                   .d88888b
