@@ -6,7 +6,7 @@ import argparse
 import json
 from time import sleep
 from threading import Lock
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from logging import FileHandler, Formatter
 from watchdog.observers import Observer
@@ -22,6 +22,7 @@ from tqdm import tqdm
 from titlecase import titlecase
 import Levenshtein
 from functools import lru_cache
+from pathlib import Path
 
 # Setting to stop the script on error or warning
 stop_on_error = True
@@ -39,12 +40,12 @@ def setup_logging():
     console_handler.setLevel(logging.DEBUG)
 
     # File handlers
-    log_directory = os.path.join(os.path.dirname(__file__), 'logs')
-    os.makedirs(log_directory, exist_ok=True)
+    log_directory = Path(__file__).parent / 'logs'
+    log_directory.mkdir(parents=True, exist_ok=True)
 
-    processing_log_file = os.path.join(log_directory, 'processing.log')
-    warning_log_file = os.path.join(log_directory, 'warnings.log')
-    error_log_file = os.path.join(log_directory, 'errors.log')
+    processing_log_file = log_directory / 'processing.log'
+    warning_log_file = log_directory / 'warnings.log'
+    error_log_file = log_directory / 'errors.log'
 
     processing_handler = FileHandler(processing_log_file)
     processing_handler.setLevel(logging.INFO)
@@ -70,21 +71,21 @@ def setup_logging():
 logger = setup_logging()
 
 # Path to the directory containing this script
-script_directory = os.path.dirname(os.path.abspath(__file__))
+script_directory = Path(__file__).parent
 
 # Config directory
-config_directory = os.path.join(script_directory, 'config')
-config_path = os.path.join(config_directory, 'config.json')
+config_directory = script_directory / 'config'
+config_path = config_directory / 'config.json'
 
 def load_config(config_path):
-    if not os.path.exists(config_path):
+    if not config_path.exists():
         return {}
-    with open(config_path, 'r') as config_file:
+    with config_path.open('r') as config_file:
         return json.load(config_file)
 
 def save_config(config, config_path):
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, 'w') as config_file:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open('w') as config_file:
         json.dump(config, config_file, indent=4)
 
 # Load main config
@@ -100,11 +101,11 @@ else:
     raise NotImplementedError("Unsupported operating system")
 
 # Get directory paths from config
-MOVIES_WATCH_DIRECTORY = os.path.abspath(os.path.normpath(paths.get('MOVIES_WATCH_DIRECTORY', '')))
-MOVIES_TARGET_DIRECTORY = os.path.abspath(os.path.normpath(paths.get('MOVIES_TARGET_DIRECTORY', '')))
-SERIES_WATCH_DIRECTORY = os.path.abspath(os.path.normpath(paths.get('SERIES_WATCH_DIRECTORY', '')))
-SERIES_TARGET_DIRECTORY = os.path.abspath(os.path.normpath(paths.get('SERIES_TARGET_DIRECTORY', '')))
-WORKING_DIRECTORY = os.path.abspath(os.path.normpath(paths.get('WORKING_DIRECTORY', '')))
+MOVIES_WATCH_DIRECTORY = Path(paths.get('MOVIES_WATCH_DIRECTORY', '')).resolve()
+MOVIES_TARGET_DIRECTORY = Path(paths.get('MOVIES_TARGET_DIRECTORY', '')).resolve()
+SERIES_WATCH_DIRECTORY = Path(paths.get('SERIES_WATCH_DIRECTORY', '')).resolve()
+SERIES_TARGET_DIRECTORY = Path(paths.get('SERIES_TARGET_DIRECTORY', '')).resolve()
+WORKING_DIRECTORY = Path(paths.get('WORKING_DIRECTORY', '')).resolve()
 
 logger.info(f"Movies Watch Directory: {MOVIES_WATCH_DIRECTORY}")
 logger.info(f"Movies Target Directory: {MOVIES_TARGET_DIRECTORY}")
@@ -120,11 +121,11 @@ class Handler(FileSystemEventHandler):
         self.series_target_directory = series_target_directory
 
         # Separate databases for movies and series
-        db_directory = os.path.join(script_directory, 'db')
-        os.makedirs(db_directory, exist_ok=True)
+        db_directory = script_directory / 'db'
+        db_directory.mkdir(parents=True, exist_ok=True)
 
-        self.movies_db_path = os.path.join(db_directory, 'movies_symlink_map.db')
-        self.series_db_path = os.path.join(db_directory, 'series_symlink_map.db')
+        self.movies_db_path = db_directory / 'movies_symlink_map.db'
+        self.series_db_path = db_directory / 'series_symlink_map.db'
 
         self.db_lock = Lock()
 
@@ -164,7 +165,7 @@ class Handler(FileSystemEventHandler):
         db_cursor = self.movies_db_cursor if is_movie else self.series_db_cursor
 
         with self.db_lock:
-            db_cursor.execute('REPLACE INTO symlink_map (file_path, symlink_path) VALUES (?, ?)', (file_path, symlink_path))
+            db_cursor.execute('REPLACE INTO symlink_map (file_path, symlink_path) VALUES (?, ?)', (str(file_path), str(symlink_path)))
             db_conn.commit()
         
         logger.info(f"Added symlink to {'movies' if is_movie else 'series'} database: {file_path} -> {symlink_path}")
@@ -173,19 +174,19 @@ class Handler(FileSystemEventHandler):
         db_cursor = self.movies_db_cursor if is_movie else self.series_db_cursor
 
         with self.db_lock:
-            db_cursor.execute('SELECT symlink_path FROM symlink_map WHERE file_path = ?', (file_path,))
+            db_cursor.execute('SELECT symlink_path FROM symlink_map WHERE file_path = ?', (str(file_path),))
             result = db_cursor.fetchone()
         
         if result:
             logger.info(f"Found existing symlink in {'movies' if is_movie else 'series'} database: {file_path} -> {result[0]}")
-        return result[0] if result else None
+        return Path(result[0]) if result else None
 
     def remove_symlink(self, file_path, is_movie=True):
         db_conn = self.movies_db_conn if is_movie else self.series_db_conn
         db_cursor = self.movies_db_cursor if is_movie else self.series_db_cursor
 
         with self.db_lock:
-            db_cursor.execute('DELETE FROM symlink_map WHERE file_path = ?', (file_path,))
+            db_cursor.execute('DELETE FROM symlink_map WHERE file_path = ?', (str(file_path),))
             db_conn.commit()
         
         logger.info(f"Removed symlink from {'movies' if is_movie else 'series'} database: {file_path}")
@@ -199,7 +200,7 @@ class Handler(FileSystemEventHandler):
                 rows = db_cursor.fetchall()
 
             for file_path, symlink_path in rows:
-                if not os.path.exists(symlink_path) or not os.path.islink(symlink_path):
+                if not Path(symlink_path).exists() or not Path(symlink_path).is_symlink():
                     logger.warning(f"Invalid symlink detected in {type_} database, removing: {symlink_path}")
                     self.remove_symlink(file_path, is_movie=(type_ == 'movies'))
 
@@ -209,19 +210,19 @@ class Handler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory:
             logger.info(f"File created: {event.src_path}")
-            self.executor.submit(self.process, event.src_path)
+            self.executor.submit(self.process, Path(event.src_path))
 
     def process(self, file_path):
         logger.info(f"Processing file: {file_path}")
-        if file_path.endswith(('.mp4', '.mkv', '.avi', '.m4v', '.mov')):
+        if file_path.suffix in {'.mp4', '.mkv', '.avi', '.m4v', '.mov'}:
             try:
                 if self.is_extras_or_deleted(file_path):
                     logger.info(f"Skipping extras or deleted scenes file: {file_path}")
                     return
 
-                cleaned_file_name = self.clean_file_name(os.path.basename(file_path))
+                cleaned_file_name = self.clean_file_name(file_path.name)
                 preprocessed_file_name = self.preprocess_file_path(file_path)
-                cleaned_file_path = os.path.join(os.path.dirname(file_path), cleaned_file_name)
+                cleaned_file_path = file_path.parent / cleaned_file_name
 
                 # Use guessit as primary and subliminal as backup for guessing
                 file_info = guessit(preprocessed_file_name)
@@ -260,7 +261,7 @@ class Handler(FileSystemEventHandler):
     def is_extras_or_deleted(self, file_path):
         # Check for terms like "extras", "deleted scenes", etc.
         extras_keywords = {'extras', 'deleted scenes', 'deleted', 'bonus', 'featurette', 'behind the scenes'}
-        file_name = os.path.basename(file_path).lower()
+        file_name = file_path.name.lower()
         return any(keyword in file_name for keyword in extras_keywords)
 
     def clean_file_name(self, name):
@@ -274,7 +275,7 @@ class Handler(FileSystemEventHandler):
         return name.strip()
 
     def preprocess_file_path(self, file_path):
-        file_name = os.path.basename(file_path)
+        file_name = file_path.name
         
         # Remove known tags and patterns
         patterns_to_remove = [
@@ -394,7 +395,7 @@ class Handler(FileSystemEventHandler):
         logger.info(f"Processing movie: {file_path} with title '{title}' and year '{year}'")
 
         existing_symlink = self.get_symlink(file_path, is_movie=True)
-        if existing_symlink and os.path.islink(existing_symlink):
+        if existing_symlink and existing_symlink.is_symlink():
             logger.info(f"Symlink already exists for {file_path}: {existing_symlink}")
             return
 
@@ -406,25 +407,25 @@ class Handler(FileSystemEventHandler):
         formatted_tmdb_id = f"tmdb-{tmdb_id}" if tmdb_id != "N/A" else ""
 
         if year == 2024:
-            movie_dir = os.path.join(self.movies_target_directory, '2024', f"{title} ({year}) {{{formatted_tmdb_id}}}")
+            movie_dir = self.movies_target_directory / '2024' / f"{title} ({year}) {{{formatted_tmdb_id}}}"
         else:
             if genres:
                 genre_dir = genres[0]  # Use the first genre for organization
-                movie_dir = os.path.join(self.movies_target_directory, genre_dir, f"{title} ({year}) {{{formatted_tmdb_id}}}")
+                movie_dir = self.movies_target_directory / genre_dir / f"{title} ({year}) {{{formatted_tmdb_id}}}"
             else:
-                movie_dir = os.path.join(self.movies_target_directory, 'Uncategorized', f"{title} ({year}) {{{formatted_tmdb_id}}}")
+                movie_dir = self.movies_target_directory / 'Uncategorized' / f"{title} ({year}) {{{formatted_tmdb_id}}}"
 
-        if os.path.exists(movie_dir) and os.listdir(movie_dir):
+        if movie_dir.exists() and any(movie_dir.iterdir()):
             logger.info(f"Skipping symlink creation for {file_path} as the directory {movie_dir} is not empty.")
             return
 
-        os.makedirs(movie_dir, exist_ok=True)
+        movie_dir.mkdir(parents=True, exist_ok=True)
         
-        movie_file_name = f"{title}{os.path.splitext(file_path)[1]}"
-        symlink_path = os.path.join(movie_dir, movie_file_name)
+        movie_file_name = f"{title}{file_path.suffix}"
+        symlink_path = movie_dir / movie_file_name
 
         try:
-            os.symlink(file_path, symlink_path)
+            symlink_path.symlink_to(file_path)
         except OSError as e:
             logger.error(f"Failed to create symlink for {file_path}: {e}", exc_info=True)
             if stop_on_error:
@@ -446,7 +447,7 @@ class Handler(FileSystemEventHandler):
 
         if not series_title:
             logger.warning(f"Series title not found for file {file_path}, using directory name as title.")
-            series_title = os.path.basename(os.path.dirname(file_path))
+            series_title = file_path.parent.name
             series_title = self.clean_directory_name(series_title)
 
         try:
@@ -456,7 +457,7 @@ class Handler(FileSystemEventHandler):
             year = None
 
         existing_symlink = self.get_symlink(file_path, is_movie=False)
-        if existing_symlink and os.path.islink(existing_symlink):
+        if existing_symlink and existing_symlink.is_symlink():
             logger.info(f"Symlink already exists for {file_path}: {existing_symlink}")
             return
 
@@ -473,7 +474,7 @@ class Handler(FileSystemEventHandler):
 
         episode_title = self.get_tmdb_episode_title(tmdb_id, season_number, episode_number) or "Unknown Title"
 
-        series_file_name = f"{series_title} - s{season_number:02d}e{episode_number:02d} - {episode_title}{os.path.splitext(file_path)[1]}"
+        series_file_name = f"{series_title} - s{season_number:02d}e{episode_number:02d} - {episode_title}{file_path.suffix}"
 
         def normalize_dir_name(name):
             year_match = re.search(r"\((\d{4})\)", name)
@@ -484,13 +485,13 @@ class Handler(FileSystemEventHandler):
         
         normalized_series_dir_name = normalize_dir_name(series_title)
 
-        existing_series_dirs = [d for d in os.listdir(self.series_target_directory) if normalize_dir_name(d) == normalize_dir_name(series_title)]
+        existing_series_dirs = [d for d in self.series_target_directory.iterdir() if normalize_dir_name(d.name) == normalize_dir_name(series_title)]
         if existing_series_dirs:
             counter = 1
             while True:
                 new_series_dir_name = f"{series_title} ({year}) ({counter})" if counter > 1 else series_title
-                new_series_dir = os.path.join(self.series_target_directory, new_series_dir_name)
-                if normalize_dir_name(new_series_dir_name) not in [normalize_dir_name(d) for d in existing_series_dirs]:
+                new_series_dir = self.series_target_directory / new_series_dir_name
+                if normalize_dir_name(new_series_dir_name) not in [normalize_dir_name(d.name) for d in existing_series_dirs]:
                     break
                 counter += 1
 
@@ -506,24 +507,24 @@ class Handler(FileSystemEventHandler):
                 if tmdb_series_year:
                     year = tmdb_series_year
                 series_dir_name = f"{series_title} ({year}) {{{formatted_tmdb_id}}}" if year else f"{series_title} {{{formatted_tmdb_id}}}"
-                series_dir = os.path.join(self.series_target_directory, series_dir_name)
+                series_dir = self.series_target_directory / series_dir_name
             else:
                 series_dir_name = f"{series_title} ({year})" if year else series_title
-                series_dir = os.path.join(self.series_target_directory, series_dir_name)
+                series_dir = self.series_target_directory / series_dir_name
 
-        os.makedirs(series_dir, exist_ok=True)
-        season_dir = os.path.join(series_dir, f"Season {season_number:02d}")
-        os.makedirs(season_dir, exist_ok=True)
+        series_dir.mkdir(parents=True, exist_ok=True)
+        season_dir = series_dir / f"Season {season_number:02d}"
+        season_dir.mkdir(parents=True, exist_ok=True)
         
-        existing_season_files = [f for f in os.listdir(season_dir) if normalize_dir_name(f) == normalize_dir_name(series_file_name)]
+        existing_season_files = [f for f in season_dir.iterdir() if normalize_dir_name(f.name) == normalize_dir_name(series_file_name)]
         if existing_season_files:
             logger.info(f"Skipping symlink creation for {file_path} as a similar file exists in the season directory.")
             return
         
-        symlink_path = os.path.join(season_dir, series_file_name)
+        symlink_path = season_dir / series_file_name
 
         try:
-            os.symlink(file_path, symlink_path)
+            symlink_path.symlink_to(file_path)
         except OSError as e:
             logger.error(f"Failed to create symlink for {file_path}: {e}", exc_info=True)
             if stop_on_error:
@@ -535,8 +536,8 @@ class Handler(FileSystemEventHandler):
 def run_watcher(movies_watch_directory, movies_target_directory, series_watch_directory, series_target_directory):
     event_handler = Handler(movies_watch_directory, movies_target_directory, series_watch_directory, series_target_directory)
     observer = Observer()
-    observer.schedule(event_handler, movies_watch_directory, recursive=True)
-    observer.schedule(event_handler, series_watch_directory, recursive=True)
+    observer.schedule(event_handler, str(movies_watch_directory), recursive=True)
+    observer.schedule(event_handler, str(series_watch_directory), recursive=True)
     observer.start()
 
     try:
@@ -587,8 +588,8 @@ def run_first_time_setup(config):
         files = []
         for subdir, _, file_list in os.walk(directory):
             for filename in file_list:
-                file_path = os.path.join(subdir, filename)
-                if os.path.isfile(file_path):
+                file_path = Path(subdir) / filename
+                if file_path.is_file():
                     files.append(file_path)
 
         for file_path in tqdm(files, desc=f"Processing {directory}"):
@@ -600,7 +601,7 @@ def run_first_time_setup(config):
         futures.append(executor.submit(process_files_in_directory, MOVIES_WATCH_DIRECTORY, handler))
         futures.append(executor.submit(process_files_in_directory, SERIES_WATCH_DIRECTORY, handler))
 
-        for future in futures:
+        for future in as_completed(futures):
             future.result()
 
     logger.info("First-time setup completed.")
@@ -644,7 +645,7 @@ WantedBy=multi-user.target
     console.print("Systemd service setup complete.", style="green")
 
 def setup_windows_service():
-    batch_script_path = os.path.abspath("RD-Sym.bat")
+    batch_script_path = Path("RD-Sym.bat").resolve()
     
     batch_script_content = f"""
 @echo off
@@ -652,11 +653,11 @@ cd /d %~dp0
 python {script_path} --watch
 """
 
-    with open(batch_script_path, "w") as batch_file:
+    with batch_script_path.open("w") as batch_file:
         batch_file.write(batch_script_content)
 
     service_name = "FileWatcherService"
-    service_exe_path = os.path.abspath("RD-Sym.bat")
+    service_exe_path = batch_script_path
     sc_create_command = f'sc create {service_name} binPath= "{service_exe_path}" start= auto'
     
     sc_start_command = f'sc start {service_name}'
